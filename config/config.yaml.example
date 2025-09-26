@@ -1,0 +1,45 @@
+# Prometheus Webhook 配置文件
+# 用于接收 Prometheus Alertmanager 的告警通知并转发到飞书群聊
+
+# 服务器配置
+server:
+  # 服务监听端口，默认为 8080
+  port: "8080"
+  # 请求超时时间，支持格式如: 30s, 1m, 1h
+  timeout: 30s
+
+# 日志配置
+logging:
+  # 日志级别: debug, info, warn, error
+  level: "info"
+  # 日志格式: json, text
+  format: "json"
+
+# 模板配置
+template:
+  # 时区设置，用于时间格式化
+  timezone: "Asia/Shanghai"
+
+# Webhook 提供商设置
+webhooks:
+  feishu:
+    # 启用此 webhook
+    enable: true
+    # 飞书 webhook URL
+    webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxx"
+    timeout: 30s
+    retry_count: 3
+    template: "templates/feishu.tmpl"
+  dingding:
+    enable: false
+    webhook_url: "https://oapi.dingtalk.com/robot/send?access_token=xxxxxxx"
+    secret: "SECxxxxxx" # 钉钉通常需要一个密钥进行签名
+    timeout: 10s
+    retry_count: 3
+    template: "templates/dingding.tmpl"
+  weixin:
+    enable: false
+    webhook_url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxx-xxxx-xxxx-xxxx-xxx"
+    timeout: 10s
+    retry_count: 3
+    template: "templates/weixin.tmpl"

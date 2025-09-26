@@ -1,0 +1,234 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{.IMAGE_NAME}}-config
+  namespace: {{.PROJECT_NAME}}
+data:
+  config.yaml: |
+    # Prometheus Webhook 配置文件
+    # 用于接收 Prometheus Alertmanager 的告警通知并转发到飞书、钉钉、企业微信群聊
+
+    # 服务器配置
+    server:
+      # 服务监听端口，默认为 8080
+      port: "8080"
+      # 请求超时时间，支持格式如: 30s, 1m, 1h
+      timeout: 30s
+
+    # 日志配置
+    logging:
+      # 日志级别: debug, info, warn, error
+      level: "info"
+      # 日志格式: json, text
+      format: "json"
+
+    # 模板配置
+    template:
+      # 时区设置，用于时间格式化
+      timezone: "Asia/Shanghai"
+
+    # Webhook 提供商设置
+    webhooks:
+      feishu:
+        # 启用此 webhook
+        enable: true
+        # 飞书 webhook URL
+        webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/a06d5b36-a9d2-4408-a1dc-5ba73810b20c"
+        timeout: 30s
+        retry_count: 3
+        template: "templates/feishu.tmpl"
+      dingding:
+        enable: false
+        webhook_url: "https://oapi.dingtalk.com/robot/send?access_token=3b270c49f421b589749d4ce9dea8b9eafda7cc08d94bbefc98e34051b7f017c5"
+        secret: "SECbd1123d0b434ac3dbd4f1f118f6148bafa392090699e87eb02012953bf2aeeed" # 钉钉通常需要一个密钥进行签名
+        timeout: 10s
+        retry_count: 3
+        template: "templates/dingding.tmpl"
+      weixin:
+        enable: false
+        webhook_url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=5f7c6145-47f9-441c-a020-f92b543a3aad"
+        timeout: 10s
+        retry_count: 3
+        template: "templates/weixin.tmpl"
+  feishu.tmpl: |
+    {{define "feishu_message"}}[
+        {{- range $i, $alert := .alerts -}}
+        {{if $i}},{{end}}
+        {
+            "msg_type": "interactive",
+            "card": {
+                "config": {
+                    "wide_screen_mode": true,
+                    "enable_forward": true
+                },
+                "header": {
+                    "template": "{{if eq $alert.Status `resolved`}}green{{else}}red{{end}}",
+                    "title": {
+                        "tag": "plain_text",
+                        "content": "PrometheusAlert"
+                    }
+                },
+                "elements": [
+                    {
+                        "tag": "div",
+                        "text": { "tag": "lark_md", "content": "{{if eq $alert.Status `resolved`}}✅ Kubernetes 集群恢复通知 ✅{{else}}🚨 Kubernetes 集群告警通知 🚨{{end}}" }
+                    },
+                    {
+                        "tag": "div",
+                        "text": { "tag": "lark_md", "content": "🔔 **告警名称:** {{$alert.Labels.alertname}}\n🚩 **告警级别:** {{$alert.Labels.severity}}" }
+                    },
+                    { "tag": "hr" },
+                    {
+                        "tag": "div",
+                        "text": { "tag": "lark_md", "content": "🔥 **告警状态:** {{$alert.Status}}\n🕒 **开始时间:** {{getCSTtime $alert.StartsAt}}{{if eq $alert.Status `resolved`}}\n🕒 **结束时间:** {{getCSTtime $alert.EndsAt}}{{end}}" }
+                    },
+                    { "tag": "hr" },
+                    {
+                        "tag": "div",
+                        "text": { "tag": "lark_md", "content": "**📌 告警详情**\n{{- range $alert.Fields}}\n- {{.key}} {{.value}}{{- end}}" }
+                    },
+                    { "tag": "hr" },
+                    {
+                        "tag": "div",
+                        "text": { "tag": "lark_md", "content": "**📝 告警描述**\n{{- if $alert.Annotations.summary}}**摘要:** {{$alert.Annotations.summary}}\n{{end}}{{- if $alert.Annotations.message}}**详情:** {{$alert.Annotations.message}}{{- end}}{{if not (or $alert.Annotations.summary $alert.Annotations.message)}}暂无描述{{end}}" }
+                    },
+                    { "tag": "hr" },
+                    {
+                        "tag": "div",
+                        "text": { "tag": "lark_md", "content": "**📅 告警时间线**\n- **首次触发:** {{getCSTtime $alert.StartsAt}}" }
+                    },
+                    { "tag": "hr" },
+                    {
+                        "tag": "div",
+                        "text": { "tag": "lark_md", "content": "**📞 联系支持**\n如有疑问，请联系 Kubernetes 运维团队或查看相关文档。" }
+                    },
+                    { "tag": "hr" },
+                    {
+                        "tag": "div",
+                        "text": { "tag": "lark_md", "content": "{{if eq $alert.Status `resolved`}}**✅ 告警已恢复，请确认业务正常运行！**{{else}}**🔔 请及时处理，避免影响业务正常运行！**{{end}}" }
+                    },
+                    {
+                        "tag": "note",
+                        "elements": [
+                            {
+                                "tag": "plain_text",
+                                "content": "PrometheusAlert"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        {{- end -}}
+    ]
+    {{end}}
+  dingding.tmpl: |
+    {{ define "dingding_message" }}
+    {
+        "msgtype": "markdown",
+        "markdown": {
+            "title": "{{ with .alerts }}{{ (index . 0).Labels.alertname }}{{ else }}Prometheus 告警{{ end }}",
+            "text": "{{ range $i, $alert := .alerts }}{{if eq .Status `resolved`}}### ✅ <font color=\"#008000\">【告警恢复】</font>\n\n{{else}}### 🚨 <font color=\"#FF0000\">【告警触发】</font>\n\n{{end}}**告警名称:** {{ .Labels.alertname }}\n\n**告警级别:** {{ .Labels.severity }}\n\n**状态:** {{ .Status }}\n\n**告警详情:**\n\n{{ range .Fields }}{{ .key }} {{ .value }}\n\n{{ end }}**摘要:** {{ .Annotations.summary }}\n\n**详情描述:** {{ if .Annotations.description }}{{ .Annotations.description }}{{ else }}{{ .Annotations.message }}{{ end }}\n\n**时间信息:**\n开始时间: {{ .StartsAt | getCSTtime }}{{if eq .Status `resolved`}}\n结束时间: {{ .EndsAt | getCSTtime }}{{end}}{{ if gt (len $.alerts) 1 }}{{ if lt $i (sub (len $.alerts) 1) }}\n\n---\n\n{{ end }}{{ end }}{{ end }}"
+        },
+        "at": {
+            "isAtAll": false
+        }
+    }
+    {{ end }} 
+  weixin.tmpl: |
+    {{ define "weixin_message" }}
+    {
+        "msgtype": "markdown",
+        "markdown": {
+            "content": "{{ range $i, $alert := .alerts }}{{if eq .Status `resolved`}}### ✅ <font color=\"info\">【告警恢复】</font>\n{{else}}### 🔥 <font color=\"warning\">【告警触发】</font>\n{{end}}**告警名称:** {{ .Labels.alertname }}\n**告警级别:** <font color=\"comment\">{{ .Labels.severity }}</font>\n**状态:** {{ .Status }}\n\n**告警详情:**\n{{ range .Fields }}- {{ .key }} {{ .value }}\n{{ end }}\n**摘要:** {{ .Annotations.summary }}\n**详情描述:** {{ if .Annotations.description }}{{ .Annotations.description }}{{ else }}{{ .Annotations.message }}{{ end }}\n\n**时间信息:**\n开始时间: {{ .StartsAt | getCSTtime }}{{if eq .Status `resolved`}}\n结束时间: {{ .EndsAt | getCSTtime }}{{end}}{{ if gt (len $.alerts) 1 }}{{ if lt $i (sub (len $.alerts) 1) }}\n---\n{{ end }}{{ end }}{{ end }}"
+        }
+    }
+    {{ end }}
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: {{.IMAGE_NAME}}
+  namespace: {{.PROJECT_NAME}}
+  labels:
+    k8s-app: {{.IMAGE_NAME}}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      k8s-app: {{.IMAGE_NAME}}
+  template:
+    metadata:
+      labels:
+        k8s-app: {{.IMAGE_NAME}}
+        logging: 'true'
+    spec:
+      containers:
+        - name: {{.IMAGE_NAME}}
+          image: "{{.HARBOR_ADDRESS}}/{{.PROJECT_NAME}}/{{.IMAGE_NAME}}:{{.TAG_NAME}}"
+          imagePullPolicy: Always
+          ports:
+            - name: http-0
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: TZ
+              value: "Asia/Shanghai"  # 设置时区，避免日志时间错乱
+          resources:
+            limits:
+              cpu: '0.5'
+              memory: 1Gi
+            requests:
+              cpu: 200m
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 15
+            timeoutSeconds: 5
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 10
+            timeoutSeconds: 1
+            periodSeconds: 5
+            successThreshold: 1
+            failureThreshold: 3
+          volumeMounts:
+            - name: config
+              mountPath: /app/config/config.yaml
+              subPath: config.yaml
+            - name: config
+              mountPath: /app/templates/feishu.tmpl
+              subPath: feishu.tmpl
+            - name: config
+              mountPath: /app/templates/dingding.tmpl
+              subPath: dingding.tmpl
+            - name: config
+              mountPath: /app/templates/weixin.tmpl
+              subPath: weixin.tmpl
+      volumes:
+        - name: config
+          configMap:
+            name: {{.IMAGE_NAME}}-config
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{.IMAGE_NAME}}
+  namespace: {{.PROJECT_NAME}}
+  labels:
+    k8s-app: {{.IMAGE_NAME}}
+spec:
+  ports:
+  - name: http
+    port: 8080
+    protocol: TCP
+    targetPort: 8080
+  selector:
+    k8s-app: {{.IMAGE_NAME}}
+  type: NodePort

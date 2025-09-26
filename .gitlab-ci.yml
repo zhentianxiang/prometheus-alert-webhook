@@ -1,0 +1,274 @@
+stages:
+  - package
+  - docker_build
+  - deploy_k8s
+
+variables:
+  GIT_DEPTH: 0    # 完整克隆代码
+  GOCACHE: "${CI_PROJECT_DIR}/.cache/go-build"   # 设置GOCACHE到当前目录下的缓存目录
+  GOPATH: "${CI_PROJECT_DIR}/.cache/go"   # 设置模块缓存位置
+
+# 全局缓存配置（所有 job 继承）
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - .cache/go-build  # 构建缓存
+    - .cache/go/pkg/mod  # 模块缓存
+    - bin/  # 构建输出目录
+  policy: pull-push
+
+before_script:
+  - mkdir -p .cache/go-build .cache/go bin/
+  - export GOCACHE="${CI_PROJECT_DIR}/.cache/go-build"
+  - export GOPATH="${CI_PROJECT_DIR}/.cache/go"
+  - export GOPROXY=https://goproxy.cn
+  - export GO111MODULE=on
+
+go_build_job:  # 修正作业名称
+  image: harbor.tianxiang.love:30443/library/golang:1.23
+  stage: package
+  tags:
+    - k8s-runner
+  script:
+    # 动态构建模式
+    - APP_NAME="prometheus-webhook-linux-amd64"
+    # 动态设置版本和环境
+    - go version
+    - |
+      case "$CI_COMMIT_BRANCH" in
+        pre*)  APP_ENV=pre; VERSION="pre-${CI_COMMIT_SHORT_SHA}" ;;
+        dev*)  APP_ENV=dev; VERSION="dev-${CI_COMMIT_SHORT_SHA}" ;;
+        main|prod*) APP_ENV=prod; VERSION="${CI_COMMIT_SHORT_SHA}" ;;
+        *) APP_ENV=unknown; VERSION="${CI_COMMIT_SHORT_SHA}" ;;
+      esac
+      COMMIT_HASH=${CI_COMMIT_SHORT_SHA}
+      BUILD_DATE=$(date +%Y-%m-%dT%H:%M:%S)
+      BUILD_FLAGS="-X main.version=${VERSION} -X main.appEnv=${APP_ENV} -X main.commitHash=${COMMIT_HASH} -X main.buildDate=${BUILD_DATE}"
+
+    # 下载依赖
+    - go mod download
+    
+    # 构建应用
+    - GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "$BUILD_FLAGS" -o bin/${APP_NAME}
+
+    # 验证构建结果
+    - ls -lah bin/
+
+  artifacts:
+    paths:
+      - bin/${APP_NAME}
+    expire_in: 1 week
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^pre.*/' # 匹配 pre 开头的分支，如 pre-2025-05-15
+      when: on_success
+    - if: '$CI_COMMIT_BRANCH =~ /^dev.*/'  # 匹配 dev 开头的分支
+      when: on_success
+    - if: '$CI_COMMIT_BRANCH == "main"'   # 只匹配 main 分支
+      when: on_success
+    - if: '$CI_COMMIT_BRANCH =~ /^prod.*/' # 匹配 prod 开头的分支，如 prod-2025-05-15
+      when: on_success
+
+docker_build_job:
+  image: harbor.tianxiang.love:30443/library/docker:latest
+  stage: docker_build
+  tags:
+    - k8s-runner
+  script:
+    # 验证上个阶段的构建产物是否在本阶段存在
+    - ls -lah bin/
+
+    # 定义 k8s 部署项目名称
+    - PROJECT_NAME="k8s-app"
+
+    # 定义镜像名称
+    - IMAGE_NAME="prometheus-webhook"
+
+    # 生成镜像标签
+    - TAG_NAME="${CI_COMMIT_REF_NAME}-$(date +%Y-%m-%d-%H-%M)-${CI_COMMIT_SHORT_SHA}-${CI_PIPELINE_ID}"
+
+    # 动态构建模式
+    - |
+      if [[ "$CI_COMMIT_BRANCH" =~ ^pre.* ]]; then
+         PROFILE=pre
+         HARBOR_ADDRESS=harbor.tianxiang.love:30443
+         # 预生产环境 Docker 认证
+         mkdir -pv ~/.docker/
+         echo $PRE_DOCKER_AUTH_CONFIG | base64 -d > ~/.docker/config.json
+         ENV_DESC="预生产环境"
+      elif [[ "$CI_COMMIT_BRANCH" == "main" || "$CI_COMMIT_BRANCH" =~ ^prod.* ]]; then
+         PROFILE=prod
+         HARBOR_ADDRESS=harbor.tianxiang.love:30443
+         # 生产环境 Docker 认证
+         mkdir -pv ~/.docker/
+         echo $PROD_DOCKER_AUTH_CONFIG | base64 -d > ~/.docker/config.json
+         ENV_DESC="生产环境"
+      else
+      echo "❌ 未识别的分支，构建终止"
+      exit 1
+      fi
+    - |
+      cat <<EOF > bin/ENV_FILE.env
+      PROJECT_NAME=$PROJECT_NAME
+      IMAGE_NAME=$IMAGE_NAME
+      TAG_NAME=$TAG_NAME
+      HARBOR_ADDRESS=$HARBOR_ADDRESS
+      EOF
+    - ls -lah templates/
+    - ls -lah config/
+    - ls -lah bin/
+    - cat bin/ENV_FILE.env
+    - docker build --build-arg PROFILE=$PROFILE -t $HARBOR_ADDRESS/$PROJECT_NAME/$IMAGE_NAME:$TAG_NAME .
+    - docker push $HARBOR_ADDRESS/$PROJECT_NAME/$IMAGE_NAME:$TAG_NAME
+    - MSG="✅ 已推送镜像 \"$HARBOR_ADDRESS/$PROJECT_NAME/$IMAGE_NAME:$TAG_NAME\" 到$ENV_DESC"
+    - echo "$MSG"
+    - docker rmi $HARBOR_ADDRESS/$PROJECT_NAME/$IMAGE_NAME:$TAG_NAME
+
+  artifacts:
+    paths:
+      - bin/ENV_FILE.env
+    expire_in: 1 week
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^pre.*/' # 匹配 pre 开头的分支，如 pre-2025-05-15
+      when: on_success
+    - if: '$CI_COMMIT_BRANCH == "main"'   # 只匹配 main 分支
+      when: on_success
+    - if: '$CI_COMMIT_BRANCH =~ /^prod.*/' # 匹配 prod 开头的分支，如 prod-2025-05-15
+      when: on_success
+
+deploy_k8s_job:
+  image: harbor.tianxiang.love:30443/library/kubectl:v1.23.0
+  stage: deploy_k8s
+  tags:
+    - k8s-runner
+  script:
+    - mkdir -pv ~/.kube/
+    # 加载缓存中的镜像信息变量
+    - ls -lah bin/
+    - cat bin/ENV_FILE.env
+    - source bin/ENV_FILE.env
+    - |
+      if [[ "$CI_COMMIT_BRANCH" =~ ^pre.* ]]; then
+        echo '部署服务到预生产环境'
+        PROFILE=pre
+        echo "$PRE_KUBE_CONFIG" | base64 -d > ~/.kube/config
+        cat ~/.kube/config
+        echo '192.168.233.246 apiserver.cluster.local' | tee -a /etc/hosts
+        cat /etc/hosts
+        sed -e "s/{{.IMAGE_NAME}}/$IMAGE_NAME/g" \
+            -e "s/{{.PROJECT_NAME}}/$PROJECT_NAME/g" \
+            -e "s/{{.TAG_NAME}}/$TAG_NAME/g" \
+            -e "s/{{.HARBOR_ADDRESS}}/$HARBOR_ADDRESS/g" \
+            -e"s/{{.PROFILE}}/$PROFILE/g" \
+               k8s/deployment-pre.tml > k8s/deployment-pre.yaml
+        cat k8s/deployment-pre.yaml
+        kubectl apply -f k8s/deployment-pre.yaml
+
+        # 检查 pod 启动情况
+        MAX_RETRIES=60
+        SLEEP_SECONDS=10
+        TIMEOUT=$((MAX_RETRIES * SLEEP_SECONDS))
+        echo "⏳ 等待新创建的 Pod 启动并全部就绪最长 $TIMEOUT 秒..."
+        NOW=$(date +%s)
+
+        for ((i = 1; i <= MAX_RETRIES; i++)); do
+          # 获取当前 Pod 信息
+          PODS_JSON=$(kubectl get pods -n "$PROJECT_NAME" -l k8s-app="$IMAGE_NAME" -o json)
+
+          # 获取就绪、运行状态且在最近 10 秒内创建的 Pod 数
+          READY_COUNT=$(echo "$PODS_JSON" | jq --argjson now "$NOW" '
+            [.items[]
+              | select(.status.phase == "Running")
+              | select(.status.containerStatuses[].ready == true)
+              | select((($now - (.metadata.creationTimestamp | sub("Z$"; "") | sub("T"; " ") | strptime("%Y-%m-%d %H:%M:%S") | mktime)) < 10))
+            ] | length
+          ')
+
+          # 获取预期副本数
+          EXPECTED_REPLICAS=$(kubectl get deploy -n "$PROJECT_NAME" "$IMAGE_NAME" -o jsonpath="{.spec.replicas}")
+
+          echo "第 $i 次检测：新就绪 Pod 数量: $READY_COUNT / 期望副本数: $EXPECTED_REPLICAS"
+
+          if [[ "$READY_COUNT" -eq "$EXPECTED_REPLICAS" ]]; then
+            echo "✅ 最新部署的 Pod 均已就绪"
+            kubectl get pods -n "$PROJECT_NAME" -l k8s-app="$IMAGE_NAME" -o wide
+            exit 0
+          fi
+
+          if [[ $i -eq $MAX_RETRIES ]]; then
+            echo "❌ 超时（${TIMEOUT} 秒）：新创建的 Pod 未全部就绪"
+            kubectl get pods -n "$PROJECT_NAME" -l k8s-app="$IMAGE_NAME" -o wide
+            kubectl describe deploy -n "$PROJECT_NAME" "$IMAGE_NAME"
+            exit 1
+          fi
+
+          sleep "$SLEEP_SECONDS"
+        done
+
+        grep -v '192.168.233.246 apiserver.cluster.local' /etc/hosts > /tmp/hosts && cat /tmp/hosts > /etc/hosts
+      elif [[ "$CI_COMMIT_BRANCH" == "main" || "$CI_COMMIT_BRANCH" =~ ^prod.* ]]; then
+        echo '部署服务到生产环境'
+        PROFILE=prod
+        echo "$PROD_KUBE_CONFIG" | base64 -d > ~/.kube/config
+        cat ~/.kube/config
+        echo '192.168.233.246 apiserver.cluster.local' | tee -a /etc/hosts
+        cat /etc/hosts
+        sed -e "s/{{.IMAGE_NAME}}/$IMAGE_NAME/g" \
+            -e "s/{{.PROJECT_NAME}}/$PROJECT_NAME/g" \
+            -e "s/{{.TAG_NAME}}/$TAG_NAME/g" \
+            -e "s/{{.HARBOR_ADDRESS}}/$HARBOR_ADDRESS/g" \
+            -e"s/{{.PROFILE}}/$PROFILE/g" \
+               k8s/deployment-prod.tml > k8s/deployment-prod.yaml
+        cat k8s/deployment-prod.yaml
+        kubectl apply -f k8s/deployment-prod.yaml
+
+        # 检查 pod 启动情况
+        MAX_RETRIES=60
+        SLEEP_SECONDS=10
+        TIMEOUT=$((MAX_RETRIES * SLEEP_SECONDS))
+        echo "⏳ 等待新创建的 Pod 启动并全部就绪最长 $TIMEOUT 秒..."
+        NOW=$(date +%s)
+
+        for ((i = 1; i <= MAX_RETRIES; i++)); do
+          # 获取当前 Pod 信息
+          PODS_JSON=$(kubectl get pods -n "$PROJECT_NAME" -l k8s-app="$IMAGE_NAME" -o json)
+
+          # 获取就绪、运行状态且在最近 10 秒内创建的 Pod 数
+          READY_COUNT=$(echo "$PODS_JSON" | jq --argjson now "$NOW" '
+            [.items[]
+              | select(.status.phase == "Running")
+              | select(.status.containerStatuses[].ready == true)
+              | select((($now - (.metadata.creationTimestamp | sub("Z$"; "") | sub("T"; " ") | strptime("%Y-%m-%d %H:%M:%S") | mktime)) < 10))
+            ] | length
+          ')
+
+          # 获取预期副本数
+          EXPECTED_REPLICAS=$(kubectl get deploy -n "$PROJECT_NAME" "$IMAGE_NAME" -o jsonpath="{.spec.replicas}")
+
+          echo "第 $i 次检测：新就绪 Pod 数量: $READY_COUNT / 期望副本数: $EXPECTED_REPLICAS"
+
+          if [[ "$READY_COUNT" -eq "$EXPECTED_REPLICAS" ]]; then
+            echo "✅ 最新部署的 Pod 均已就绪"
+            kubectl get pods -n "$PROJECT_NAME" -l k8s-app="$IMAGE_NAME" -o wide
+            exit 0
+          fi
+
+          if [[ $i -eq $MAX_RETRIES ]]; then
+            echo "❌ 超时（${TIMEOUT} 秒）：新创建的 Pod 未全部就绪"
+            kubectl get pods -n "$PROJECT_NAME" -l k8s-app="$IMAGE_NAME" -o wide
+            kubectl describe deploy -n "$PROJECT_NAME" "$IMAGE_NAME"
+            exit 1
+          fi
+
+          sleep "$SLEEP_SECONDS"
+        done
+        grep -v '192.168.233.246 apiserver.cluster.local' /etc/hosts > /tmp/hosts && cat /tmp/hosts > /etc/hosts
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^pre.*/' # 匹配 pre 开头的分支，如 pre-2025-05-15
+      when: on_success
+    - if: '$CI_COMMIT_BRANCH == "main"'   # 只匹配 main 分支
+      when: manual  # 手动触发 main 分支部署
+    - if: '$CI_COMMIT_BRANCH =~ /^prod.*/' # 匹配 prod 开头的分支，如 prod-2025-05-15
+      when: manual  # 手动触发 prod 开头的分支部署

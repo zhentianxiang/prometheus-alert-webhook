@@ -1,0 +1,12 @@
+{{ define "dingding_message" }}
+{
+    "msgtype": "markdown",
+    "markdown": {
+        "title": "{{ with .alerts }}{{ (index . 0).Labels.alertname }}{{ else }}Prometheus 告警{{ end }}",
+        "text": "{{ range $i, $alert := .alerts }}{{if eq .Status `resolved`}}### ✅ <font color=\"#008000\">【告警恢复】</font>\n\n{{else}}### 🚨 <font color=\"#FF0000\">【告警触发】</font>\n\n{{end}}**告警名称:** {{ .Labels.alertname }}\n\n**告警级别:** {{ .Labels.severity }}\n\n**状态:** {{ .Status }}\n\n**告警详情:**\n\n{{ range .Fields }}{{ .key }} {{ .value }}\n\n{{ end }}**摘要:** {{ .Annotations.summary }}\n\n**详情描述:** {{ if .Annotations.description }}{{ .Annotations.description }}{{ else }}{{ .Annotations.message }}{{ end }}\n\n**时间信息:**\n开始时间: {{ .StartsAt | getCSTtime }}{{if eq .Status `resolved`}}\n结束时间: {{ .EndsAt | getCSTtime }}{{end}}{{ if gt (len $.alerts) 1 }}{{ if lt $i (sub (len $.alerts) 1) }}\n\n---\n\n{{ end }}{{ end }}{{ end }}"
+    },
+    "at": {
+        "isAtAll": false
+    }
+}
+{{ end }}

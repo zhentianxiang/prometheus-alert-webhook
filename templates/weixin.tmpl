@@ -1,0 +1,8 @@
+{{ define "weixin_message" }}
+{
+    "msgtype": "markdown",
+    "markdown": {
+        "content": "{{ range $i, $alert := .alerts }}{{if eq .Status `resolved`}}### ✅ <font color=\"info\">【告警恢复】</font>\n{{else}}### 🔥 <font color=\"warning\">【告警触发】</font>\n{{end}}**告警名称:** {{ .Labels.alertname }}\n**告警级别:** <font color=\"comment\">{{ .Labels.severity }}</font>\n**状态:** {{ .Status }}\n\n**告警详情:**\n{{ range .Fields }}- {{ .key }} {{ .value }}\n{{ end }}\n**摘要:** {{ .Annotations.summary }}\n**详情描述:** {{ if .Annotations.description }}{{ .Annotations.description }}{{ else }}{{ .Annotations.message }}{{ end }}\n\n**时间信息:**\n开始时间: {{ .StartsAt | getCSTtime }}{{if eq .Status `resolved`}}\n结束时间: {{ .EndsAt | getCSTtime }}{{end}}{{ if gt (len $.alerts) 1 }}{{ if lt $i (sub (len $.alerts) 1) }}\n---\n{{ end }}{{ end }}{{ end }}"
+    }
+}
+{{ end }}
